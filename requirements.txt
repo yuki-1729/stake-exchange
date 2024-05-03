@@ -1,0 +1,4 @@
+nextcord
+python-dotenv
+git+https://github.com/yuki-1729/stake.py.git
+git+https://github.com/yuki-1729/paypay.py.git
