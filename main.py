@@ -3,13 +3,14 @@ start_time = time.time()
 
 import os
 import json
+import asyncio
 import nextcord
 
 from paypay import PayPay
-from views import LoginModal
 from dotenv import load_dotenv
 from nextcord.ext import commands
 from stake import Stake, StakeSocket
+from views import LoginModal, SellButtons, SellPhase, BuyPhase
 
 load_dotenv(verbose=True)
 load_dotenv(".env")
@@ -28,16 +29,88 @@ if os.path.isfile("cache.json"):
 
     paypay = PayPay(paypay_token)
 
+class Cache:
+    def __init__(self):
+        self.ticket_data = {}
+cache = Cache()
+
 @stake_socks.event()
 async def on_data_received(data):
     return
 
 @bot.event
 async def on_ready():
+    bot.add_view(SellButtons(stake, cache))
+
     end_time = time.time()
     total_time = round(end_time - start_time, 2)
 
     print(f"Done ({total_time}s)")
+
+@bot.event
+async def on_message(message):
+    ticket_data = cache.ticket_data.get(message.channel.id)
+    if ticket_data == None:
+        return
+    elif ticket_data["phase"] == SellPhase.LOADING:
+        return
+    elif ticket_data["phase"] == BuyPhase.LOADING:
+        return
+    
+    # Sell(販売) IF Statement
+    if ticket_data["phase"] == SellPhase.WAITING_PAYPAY:
+        cache.ticket_data[message.channel.id]["phase"] = SellPhase.LOADING
+
+        await message.channel.send("受け取り中...")
+
+        coro = asyncio.to_thread(paypay.get_link, message.content.replace("https://pay.paypay.ne.jp/", ""))
+
+        try:
+            result = await coro
+            cache.ticket_data[message.channel.id]["paypay_link"] = message.content.replace("https://pay.paypay.ne.jp/", "")
+            cache.ticket_data[message.channel.id]["paypay_amount"] = result["payload"]["amount"]
+            if result["payload"]["pendingP2PInfo"]["isSetPasscode"]:
+                cache.ticket_data[message.channel.id]["phase"] = SellPhase.WAITING_PAYPAY_PASSCODE
+                await message.channel.send("パスコードを送信してください")
+        except:
+            await message.channel.send("処理中にエラーが発生しました")
+    elif ticket_data["phase"] == SellPhase.WAITING_PAYPAY_PASSCODE:
+        cache.ticket_data[message.channel.id]["phase"] = SellPhase.LOADING
+
+        await message.channel.send("受け取り中...")
+
+        code = cache.ticket_data[message.channel.id]["paypay"]
+        passcode = message.content
+        coro = asyncio.to_thread(paypay.accept_link, code, passcode)
+
+        try:
+            await coro
+        except:
+            await message.channel.send("処理中にエラーが発生しました")
+            return
+        await message.channel.send("送金中...")
+
+        ltc_rate = None
+
+        rate = stake.get_currency_rate()
+        for currency_data in rate["data"]["info"]["currencies"]:
+            if currency_data["name"] == "ltc":
+                ltc_rate = currency_data["jpy"]
+
+        send_amount = ((int(os.getenv("SELL_RATE")) / 100) * cache.ticket_data[message.channel.id]["paypay_amount"]) / ltc_rate
+
+        coro = asyncio.to_thread(stake.send_tip(ticket_data["stake"], "ltc", send_amount))
+
+        try:
+            await coro
+            await message.channel.send("送金完了")
+        except:
+            await message.channel.send("処理中にエラーが発生しました")
+            return
+        
+        await message.channel.send("換金が完了しました")
+
+
 
 @bot.slash_command(
     name="login",
@@ -51,5 +124,30 @@ async def login_command(
         return
 
     await interaction.response.send_modal(LoginModal(paypay))
+
+@bot.slash_command(
+    name="panel",
+    description="買取または販売のパネルを設置します"
+)
+async def panel_command(
+    interaction: nextcord.Interaction
+):
+    pass
+
+@panel_command.subcommand(
+    name="sell",
+    description="販売パネルを設置します"
+)
+async def panel_sub_sell_command(
+    interaction: nextcord.Interaction
+):
+    if str(interaction.user.id) != os.getenv("OWNER"):
+        await interaction.response.send_message("このコマンドを使用する権限がありません", ephemeral=True)
+        return
+    
+    sell_rate = os.getenv("SELL_RATE")
+    await interaction.channel.send(f"**=== LTC販売(換金率: {sell_rate}%) ===**", view=SellButtons(stake, cache))
+
+    await interaction.response.send_message("販売パネルを設置しました", ephemeral=True)
 
 bot.run(os.getenv("TOKEN"))
