@@ -10,7 +10,7 @@ from paypay import PayPay
 from dotenv import load_dotenv
 from nextcord.ext import commands
 from stake import Stake, StakeSocket
-from views import LoginModal, SellButtons, SellPhase, BuyPhase
+from views import LoginModal, SellButtons, BuyButtons, SellPhase, BuyPhase
 
 load_dotenv(verbose=True)
 load_dotenv(".env")
@@ -32,15 +32,57 @@ if os.path.isfile("cache.json"):
 class Cache:
     def __init__(self):
         self.ticket_data = {}
+        self.buy_data = {}
 cache = Cache()
 
 @stake_socks.event()
 async def on_data_received(data):
+    base = data["notifications"]["data"]
+
+    currency = base["currency"]
+    amount = base["amount"]
+    created = base["sendBy"]
+
+    if cache.buy_data.get(created) == None:
+        return
+    
+    guild = bot.get_guild(cache.buy_data[created]["guild"])
+    if guild == None:
+        return
+    
+    ticket_channel = guild.get_channel(cache.buy_data[created]["channel"])
+    if ticket_channel == None:
+        return
+    
+    if currency != "ltc":
+        await ticket_channel.send("送信された通貨はLTCではないようです。")
+        return
+
+    cache.ticket_data[ticket_channel.id]["phase"] = BuyPhase.LOADING
+    await ticket_channel.send(f"Stakeで{amount}LTC受け取りました。\n処理を開始しますのでお待ちください。")
+
+    ltc_rate = None
+
+    coro = asyncio.to_thread(stake.get_currency_rate)
+    rate = await coro
+    for currency_data in rate["data"]["info"]["currencies"]:
+        if currency_data["name"] == "ltc":
+            ltc_rate = currency_data["jpy"]
+
+    send_amount = ((int(os.getenv("BUY_RATE")) / 100) * amount) * ltc_rate
+
+    coro = asyncio.to_thread(paypay.create_link(send_amount, "1234"))
+    result = await coro 
+
+    link = result["payload"]["link"]
+
+    await ticket_channel.send(f"換金が完了しました。\n\n**リンク:** {link}\n**パスコード:** 1234\n\n**このリンクをこのままLTC販売へ渡さないでください！**")
     return
 
 @bot.event
 async def on_ready():
     bot.add_view(SellButtons(stake, cache))
+    bot.add_view(BuyButtons(stake, cache))
 
     end_time = time.time()
     total_time = round(end_time - start_time, 2)
@@ -54,7 +96,7 @@ async def on_message(message):
         return
     elif ticket_data["phase"] == SellPhase.LOADING:
         return
-    elif ticket_data["phase"] == BuyPhase.LOADING:
+    elif ticket_data["phase"] == BuyPhase.LOADING or ticket_data == BuyPhase.WAITING_LTC:
         return
     
     # Sell(販売) IF Statement
@@ -92,7 +134,8 @@ async def on_message(message):
 
         ltc_rate = None
 
-        rate = stake.get_currency_rate()
+        coro = asyncio.to_thread(stake.get_currency_rate)
+        rate = await coro
         for currency_data in rate["data"]["info"]["currencies"]:
             if currency_data["name"] == "ltc":
                 ltc_rate = currency_data["jpy"]

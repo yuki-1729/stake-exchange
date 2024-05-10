@@ -48,7 +48,7 @@ class LoginModal(nextcord.ui.Modal):
             await status_message.edit("ログインに失敗しました")
             return
         
-        await status_message.edit("OTP(二段階認証URL)を送信しました", view=LoginProcess(self.paypay_class, status_message))
+        await status_message.edit("ログイン用URLを送信しました", view=LoginProcess(self.paypay_class, status_message))
 
 class LoginProcess(nextcord.ui.View):
     def __init__(self, paypay_class, status_message_obj):
@@ -59,39 +59,37 @@ class LoginProcess(nextcord.ui.View):
         self.paypay_class = paypay_class
         self.status_message_obj = status_message_obj
 
-    @nextcord.ui.button(label="OTPを入力", style=nextcord.ButtonStyle.green)
+    @nextcord.ui.button(label="URLを入力", style=nextcord.ButtonStyle.green)
     async def callback(
         self,
         button: nextcord.ui.Button,
         interaction: nextcord.Interaction
     ):
-        await interaction.response.send_modal(LoginOTPModal(self.paypay_class, self.status_message_obj))
+        await interaction.response.send_modal(LoginVerifyModal(self.paypay_class, self.status_message_obj))
 
-class LoginOTPModal(nextcord.ui.Modal):
+class LoginVerifyModal(nextcord.ui.Modal):
     def __init__(self, paypay_class, status_message_obj):
         super().__init__(
-            title="ログイン - OTP",
+            title="ログイン",
             timeout=None
         )
 
         self.paypay_class = paypay_class
         self.status_message_obj = status_message_obj
 
-        self.otp = nextcord.ui.TextInput(
-            label="OTPコード",
+        self.url = nextcord.ui.TextInput(
+            label="ログインリンク",
             style=nextcord.TextInputStyle.short,
-            min_length=4,
-            max_length=4,
             required=True,
-            placeholder="4桁のワンタイムコード"
+            placeholder="SMSで送られてきたログイン用URL"
         )
-        self.add_item(self.otp)
+        self.add_item(self.url)
 
     async def callback(
         self,
         interaction: nextcord.Interaction
     ):
-        coro = asyncio.to_thread(self.paypay_class.login_confirm, self.otp.value)
+        coro = asyncio.to_thread(self.paypay_class.login_confirm, self.url.value)
 
         await self.status_message_obj.edit("ログインを続行中...", view=None)
         status_message = await interaction.response.send_message("ログイン中...", ephemeral=True)
@@ -225,13 +223,99 @@ class SellConfirm(nextcord.ui.View):
     ):
         await interaction.channel.delete()
 
+# LTC Buy(買取) Classes
+class BuyButtons(nextcord.ui.View):
+    def __init__(self, stake_class, cache):
+        super().__init__(
+            timeout=None
+        )
+
+        self.stake_class = stake_class
+        self.cache = cache
+
+    @nextcord.ui.button(label="換金", custom_id="buy_start", style=nextcord.ButtonStyle.green)
+    async def buy_start(
+        self,
+        button: nextcord.ui.Button,
+        interaction: nextcord.Interaction
+    ):
+        with open("data.json", "r", encoding="utf-8", errors="ignore") as file:
+            data = json.load(file)
+        from_stake_id = data.get(str(interaction.user.id))
+
+        coro = asyncio.to_thread(self.stake_class.get_user_meta)
+        try:
+            user_data = await coro
+        except:
+            await interaction.response.send_message("ロードに失敗しました", ephemeral=True)
+            return
+        to_stake_id = user_data["data"]["user"]["name"]
+
+        if from_stake_id == None:
+            await interaction.response.send_message("StakeIDが設定されていません", ephemeral=True)
+            return
+        
+        status_message = await interaction.response.send_message("チケットを作成中...", ephemeral=True)
+
+        try:
+            random_num = random.randint(1000, 9999)
+            ticket_channel = await interaction.guild.create_text_channel(f"sell-{random_num}")
+            ticket_channel.set_permissions(interaction.guild.default_role, nextcord.PermissionOverwrite(view_channel=False))
+            ticket_channel.set_permissions(interaction.user, nextcord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True))
+            self.cache.ticket_data[interaction.channel_id] = {
+                "user": interaction.user.id,
+                "stake": from_stake_id,
+                "phase": BuyPhase.LOADING
+            }
+            self.cache.buy_data[from_stake_id] = {
+                "guild": interaction.guild_id,
+                "channel": interaction.channel_id
+            }
+            await ticket_channel.send(f"StakeIDは「`{from_stake_id}`」に設定されています。\n本当によろしければ「続行」ボタンを押してください。\n\n**IDミスによる返金は致しかねます!**", view=SellConfirm(to_stake_id, self.cache))
+            await status_message.edit(f"チケットを作成しました: <#{ticket_channel.id}>")
+        except:
+            await status_message.edit("チケットの作成に失敗しました")
+
+    @nextcord.ui.button(label="ID設定", custom_id="buy_setting_id", style=nextcord.ButtonStyle.gray)
+    async def set_id(
+        self,
+        button: nextcord.ui.Button,
+        interaction: nextcord.Interaction
+    ):
+        await interaction.response.send_modal(StakeIDModal(self.stake_class))
+
+class BuyConfirm(nextcord.ui.View):
+    def __init__(self, stake_id, cache):
+        super().__init__(
+            timeout=None
+        )
+
+        self.stake_id = stake_id
+        self.cache = cache
+
+    @nextcord.ui.button(label="続行", style=nextcord.ButtonStyle.green)
+    async def confirm(
+        self,
+        button: nextcord.ui.Button,
+        interaction: nextcord.Interaction
+    ):
+        self.cache.ticket_data[interaction.channel_id]["phase"] = BuyPhase.WAITING_LTC
+        await interaction.response.send_message(f"Stake「{self.stake_id}」にLTCチップを換金したい分だけ送信してください。")
+
+    @nextcord.ui.button(label="キャンセル", style=nextcord.ButtonStyle.gray)
+    async def cancel(
+        self,
+        button: nextcord.ui.Button,
+        interaction: nextcord.Interaction
+    ):
+        await interaction.channel.delete()
+
 # Phase Enum Classes
 class SellPhase(Enum):
-    LOADING=0
-    WAITING_PAYPAY=1
-    WAITING_PAYPAY_PASSCODE=2
+    LOADING=10
+    WAITING_PAYPAY=11
+    WAITING_PAYPAY_PASSCODE=12
 
 class BuyPhase(Enum):
-    LOADING=0
-    WAITING_LTC=1
-    COMPLETE=2
+    LOADING=20
+    WAITING_LTC=21
